@@ -1,2 +1,173 @@
-# data
-project
+# Codes using Google Colab
+# Step 1: Install and Import Libraries
+# Install the datasets library
+!pip install datasets
+
+import pandas as pd
+from sklearn.model_selection import train_test_split
+from transformers import AutoTokenizer, AutoModelForSequenceClassification, TrainingArguments, Trainer
+import numpy as np
+from sklearn.metrics import accuracy_score, precision_score, recall_score, f1_score, roc_auc_score
+from datasets import Dataset  # Import the Dataset class
+import io
+
+# Step 2: Load the Dataset
+# Load the dataset, handling potential DtypeWarning
+from google.colab import files
+uploaded = files.upload()
+
+for filename in uploaded.keys():
+    if filename.endswith(".csv"):
+        try:
+            df = pd.read_csv(io.BytesIO(uploaded[filename]), low_memory=False)  # Add low_memory=False
+        except UnicodeDecodeError:
+            df = pd.read_csv(io.BytesIO(uploaded[filename]), encoding='latin1', low_memory=False)  # Add low_memory=False
+        break
+
+# Print the first few rows and column names to understand the data structure
+print(df.head())
+print(df.columns)
+# Rename 'Email Type' to 'label'
+df = df.rename(columns={'Email Type': 'label', 'Email Text': 'text'})
+
+# Drop the 'sn' column, as it's likely an index column.
+if 'sn' in df.columns:
+    df = df.drop('sn', axis=1)
+
+# Convert labels to integers (if needed)
+if df['label'].dtype == 'object':
+    df["label"] = df["label"].map({"Safe Email": 0, "Phishing Email": 1})
+elif df['label'].dtype == 'float64':
+    df['label'] = df['label'].astype(int)
+
+# Inspect column names after renaming
+print("Columns after renaming:", df.columns)
+
+# Preprocessing
+# Drop rows with missing values
+df.dropna(inplace=True)
+
+# Convert labels to integers
+df['label'] = df['label'].astype(int)
+
+# Rename Columns if needed.
+if "text" not in df.columns or "label" not in df.columns:
+    print("Error: DataFrame must have 'text' and 'label' columns.")
+    exit()
+
+# Split the Dataset
+train_df, test_df = train_test_split(df, test_size=0.15, random_state=42)
+train_df, val_df = train_test_split(train_df, test_size=0.15, random_state=42)
+
+train_dataset = Dataset.from_pandas(train_df)
+val_dataset = Dataset.from_pandas(val_df)
+test_dataset = Dataset.from_pandas(test_df)
+
+# Tokenize the Data
+model_name = "distilbert-base-uncased"
+tokenizer = AutoTokenizer.from_pretrained(model_name)
+
+def tokenize_function(examples):
+    texts = [str(text) for text in examples["text"]]
+    return tokenizer(texts, padding="max_length", truncation=True, max_length=512)
+
+train_dataset = train_dataset.map(tokenize_function, batched=True, batch_size=16)
+val_dataset = val_dataset.map(tokenize_function, batched=True, batch_size=16)
+test_dataset = test_dataset.map(tokenize_function, batched=True, batch_size=16)
+
+# Load Pre-trained LLM
+model = AutoModelForSequenceClassification.from_pretrained(model_name, num_labels=2)
+
+# Training Arguments
+training_args = TrainingArguments(
+    output_dir="./results",
+    learning_rate=2e-5,
+    per_device_train_batch_size=16,
+    per_device_eval_batch_size=16,
+    num_train_epochs=3,
+    weight_decay=0.01,
+    logging_dir="./logs",
+    logging_steps=10,
+    save_strategy="epoch",
+    save_total_limit=2,
+    metric_for_best_model="f1",
+    load_best_model_at_end=True,
+    eval_strategy="epoch"
+)
+
+# Metrics
+def compute_metrics(eval_pred):
+    logits, labels = eval_pred
+    predictions = np.argmax(logits, axis=-1)
+    accuracy = accuracy_score(labels, predictions)
+    precision = precision_score(labels, predictions, zero_division=0)
+    recall = recall_score(labels, predictions, zero_division=0)
+    f1 = f1_score(labels, predictions, zero_division=0)
+    try:
+        auc = roc_auc_score(labels, logits[:, 1])
+    except ValueError:
+        auc = 0.5
+    return {
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
+        "auc": auc,
+    }
+
+# Train
+trainer = Trainer(
+    model=model,
+    args=training_args,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,
+    compute_metrics=compute_metrics,
+)
+
+trainer.train()
+
+# Evaluate on Test Set
+test_results = trainer.evaluate(test_dataset)
+print("Test Results:", test_results)
+
+# Save Model
+model.save_pretrained("./phishing_detection_model")
+tokenizer.save_pretrained("./phishing_detection_tokenizer")
+
+# Load Model for Inference
+loaded_model = AutoModelForSequenceClassification.from_pretrained("./phishing_detection_model")
+loaded_tokenizer = AutoTokenizer.from_pretrained("./phishing_detection_tokenizer")
+
+def predict_phishing(email_text):
+    inputs = loaded_tokenizer(email_text, return_tensors="pt", padding=True, truncation=True, max_length=512)
+    outputs = loaded_model(**inputs)
+    probs = outputs.logits.softmax(dim=-1)
+    return "Phishing" if probs.argmax().item() == 1 else "Legitimate"
+
+sample_email = "Congratulations! You've won a $1000 gift card. Click here to claim your prize."
+print("Prediction:", predict_phishing(sample_email))
+
+# Extract and Print Tables of Results
+print("\nTraining Results:")
+training_metrics = trainer.state.log_history
+for entry in training_metrics:
+    if "eval_loss" in entry:
+        print(entry)
+
+print("\nTest Results Table:")
+test_table = pd.DataFrame([test_results])
+print(test_table)
+
+# Create a sample table from the training history.
+eval_results = []
+for entry in training_metrics:
+  if 'eval_loss' in entry:
+    eval_results.append(entry)
+
+if eval_results:
+  eval_df = pd.DataFrame(eval_results)
+  print("\nEvaluation Results During Training:")
+  print(eval_df)
+
+else:
+  print("\nNo Evaluation Results During Training to display as a table.")
